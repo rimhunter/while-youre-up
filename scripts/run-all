@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Run every game launch the suite needs and summarize them (orum/rimhunter#8, #25).
+
+Launches, in order: the default scenario list with no extra mods; one launch per set of required
+mods (a scenario declares its set with Mods = "..." in its [Scenario] attribute; the token
+puah-fork stands for each Pick Up And Haul fork in turn); each settings-import case
+(scripts/test-settings-import); the language check (scripts/test-language). With
+--with-runner-proofs it also runs scripts/test-runner-lifetime, scripts/test-map-determinism and,
+on 1.7, scripts/test-crash-report.
+With --with-screenshots it also runs the windowed screenshot scenarios (Windowed = true), one
+launch per set of mods, which open a game window on this host's desktop session, and saves
+the shareable copies of their screenshots under the logs folder. On RimWorld 1.6 (Unity) the scenarios
+that draw GUI outside the game's own frame (WindowedOnUnity = true) need a window, so they get a
+windowed launch of their own in the regular pass; on 1.7 they are in the default headless list.
+Prints one line per launch and exits 1 if any launch failed, 4 on a setup error.
+
+    scripts/run-all [--with-runner-proofs] [--with-screenshots] [--stop-on-failure] [run-scenarios options such as --timeout]
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPO = os.path.dirname(HERE)
+
+
+def script(name):
+    return os.path.join(HERE, name)
+
+
+def scenario_catalog():
+    out = subprocess.run([script("run-scenarios"), "--list-json"], check=True, capture_output=True, text=True).stdout
+    return json.loads(out)
+
+
+def mod_arg(token):
+    path = os.path.join(REPO, token)
+    return path if os.path.isdir(path) else token
+
+
+def takes(kind, s, game_line):
+    if s["selftest"] or (s["only_on"] and s["only_on"] != game_line):
+        return False
+    if kind == "mods":
+        return not s["windowed"] and bool(s["mods"])
+    if kind == "gui":
+        return s["windowed"] and s["windowed_on_unity"]
+    return s["windowed"] and not s["windowed_on_unity"]
+
+
+def grouped_launches(catalog, kind, screenshot_dir):
+    groups = {}
+    for s in catalog["scenarios"]:
+        if not takes(kind, s, catalog["game_line"]):
+            continue
+        groups.setdefault((tuple(sorted(s["mods"])), tuple(sorted(s["stage_mods"]))), []).append(s["name"])
+    launches = []
+    for (mods, staged), names in sorted(groups.items()):
+        variants = [[]]
+        for token in mods:
+            options = catalog["puah_forks"] if token == "puah-fork" else [token]
+            variants = [v + [o] for v in variants for o in options]
+        for variant in variants:
+            label = {"mods": "mods", "gui": "GUI in a window (1.6)", "screenshots": "screenshots"}[kind] + (" " + " + ".join(variant + list(staged)) if variant or staged else "")
+            cmd = [script("run-scenarios"), "-s", ",".join(names)]
+            for m in variant:
+                cmd += ["--mod", mod_arg(m)]
+            for m in staged:
+                cmd += ["--stage-mod", mod_arg(m)]
+            if kind == "gui":
+                cmd.append("--windowed")
+            if kind == "screenshots":
+                cmd += ["--windowed", "--save-screenshots", screenshot_dir]
+            launches.append((label, cmd, True))
+    return launches
+
+
+def plan(catalog, with_proofs, with_screenshots, screenshot_dir):
+    launches = [("default scenarios", [script("run-scenarios")], True)]
+    launches += grouped_launches(catalog, "gui", screenshot_dir)
+    launches += grouped_launches(catalog, "mods", screenshot_dir)
+    cases = subprocess.run([script("test-settings-import"), "--cases"], check=True, capture_output=True, text=True).stdout.split()
+    launches += [("settings import: " + c, [script("test-settings-import"), c], True) for c in cases]
+    launches.append(("language: French", [script("test-language")], True))
+    if with_proofs:
+        launches.append(("runner lifetime (SIGTERM, SIGKILL)", [script("test-runner-lifetime")], False))
+        launches.append(("map determinism (two launches)", [script("test-map-determinism")], False))
+        if catalog["game_line"] == "1.7":
+            launches.append(("crash report from core dumps (three launches)", [script("test-crash-report")], False))
+    if with_screenshots:
+        launches += grouped_launches(catalog, "screenshots", screenshot_dir)
+    return launches
+
+
+def counts(result_file):
+    if not os.path.isfile(result_file):
+        return ""
+    with open(result_file, encoding="utf-8") as f:
+        scenarios = json.load(f)["scenarios"]
+    passed = sum(1 for s in scenarios if s["status"] == "pass")
+    return "%d pass, %d fail" % (passed, len(scenarios) - passed)
+
+
+def main():
+    args = sys.argv[1:]
+    with_proofs = "--with-runner-proofs" in args
+    with_screenshots = "--with-screenshots" in args
+    stop = "--stop-on-failure" in args
+    extra = [a for a in args if a not in ("--with-runner-proofs", "--with-screenshots", "--stop-on-failure")]
+    work = tempfile.mkdtemp(prefix="wyu-run-all.")
+    screenshot_dir = os.path.join(work, "screenshots")
+    launches = plan(scenario_catalog(), with_proofs, with_screenshots, screenshot_dir)
+    rows = []
+    build_done = False
+    for i, (label, cmd, takes_options) in enumerate(launches):
+        result_file = os.path.join(work, "%02d.json" % i)
+        full = list(cmd)
+        if takes_options:
+            full += ["--result-file", result_file] + extra
+            if build_done:
+                full.append("--no-build")
+        log = os.path.join(work, "%02d.log" % i)
+        print("[%d/%d] %s ..." % (i + 1, len(launches), label), flush=True)
+        started = time.time()
+        with open(log, "w") as out:
+            rc = subprocess.run(full, stdout=out, stderr=subprocess.STDOUT).returncode
+        build_done = build_done or takes_options
+        rows.append((label, rc, time.time() - started, counts(result_file), log))
+        if rc != 0:
+            with open(log, errors="replace") as f:
+                tail = f.readlines()[-40:]
+            print("".join("    " + line for line in tail), end="", flush=True)
+            if stop:
+                break
+    print("\nlaunch summary")
+    for label, rc, secs, count, log in rows:
+        print("  %-4s %-45s exit %-3d %5.0f s  %s" % ("PASS" if rc == 0 else "FAIL", label, rc, secs, count))
+    failed = [r for r in rows if r[1] != 0]
+    skipped = len(launches) - len(rows)
+    print("logs: " + work)
+    if with_screenshots:
+        print("screenshots: " + screenshot_dir)
+    print("OVERALL: %s (%d launches run, %d failed%s)" % ("FAIL" if failed or skipped else "PASS", len(rows), len(failed), ", %d not run" % skipped if skipped else ""))
+    return 1 if failed or skipped else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

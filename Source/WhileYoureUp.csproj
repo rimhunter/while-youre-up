@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <GameVersion Condition="'$(GameVersion)' != '1.6' And '$(GameVersion)' != '1.7'">invalid</GameVersion>
+        <RimWorldRefVersion Condition="'$(GameVersion)' == '1.6'">1.6.4871</RimWorldRefVersion>
+        <RimWorldRefVersion Condition="'$(GameVersion)' == '1.7'">1.7.5005-unstable</RimWorldRefVersion>
+        <TargetFramework Condition="'$(GameVersion)' == '1.6'">net472</TargetFramework>
+        <TargetFramework Condition="'$(GameVersion)' == '1.7'">net10.0</TargetFramework>
+        <GameVersionConstant>RW_$(GameVersion.Replace('.', '_'))</GameVersionConstant>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <LangVersion>latest</LangVersion>
+        <AssemblyName>WhileYoureUp</AssemblyName>
+        <RootNamespace>WhileYoureUp</RootNamespace>
+        <Nullable>warnings</Nullable>
+        <Copyright>Copyright © 2020 Christopher Galpin, modifications Copyright © 2026 rimhunter</Copyright>
+        <Version>4.1.0</Version>
+        <DefineConstants>$(DefineConstants);$(GameVersionConstant)</DefineConstants>
+        <PublicizeAsReferenceAssemblies>false</PublicizeAsReferenceAssemblies>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <OutputPath>$(MSBuildProjectDirectory)/../$(GameVersion)/Assemblies/</OutputPath>
+        <GenerateDocumentationFile>false</GenerateDocumentationFile>
+        <GenerateDependencyFile>false</GenerateDependencyFile>
+        <DebugType>portable</DebugType>
+        <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    </PropertyGroup>
+
+    <Target Name="RequireGameVersion" BeforeTargets="BeforeBuild;Restore" Condition="'$(GameVersion)' == 'invalid'">
+        <Error Text="Set -p:GameVersion=1.6 or -p:GameVersion=1.7, or build the repo root (dotnet build) for both."/>
+    </Target>
+
+    <ItemGroup>
+        <Publicize Include="Assembly-CSharp;UnityEngine.CoreModule"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Krafs.Rimworld.Ref" Version="$(RimWorldRefVersion)" PrivateAssets="all" ExcludeAssets="runtime"/>
+        <PackageReference Include="Krafs.Publicizer" Version="2.3.2" PrivateAssets="all"/>
+        <PackageReference Include="Lib.Harmony" Version="2.4.3" PrivateAssets="all" ExcludeAssets="runtime"/>
+    </ItemGroup>
+
+    <Target Name="BuildMessage" AfterTargets="Build">
+        <Message Text="While You're Up $(Version) for RimWorld $(GameVersion) -> $(OutputPath)" Importance="High"/>
+    </Target>
+</Project>

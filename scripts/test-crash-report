@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Proves scripts/run-scenarios names a native game crash from its core dump (orum/rimhunter#28).
+
+1. The crash reader on captured `coredumpctl info` stacks (scripts/fixtures): the MonoMod JIT
+   re-entry crash is named as the known upstream crash, the #24 GC crash is not.
+2. Unless --no-game: a launch whose scenario aborts the game natively (selftest-native-crash)
+   exits 2 and prints the crashing thread's frames from the core dump; a launch that sets up the
+   MonoMod JIT re-entry in the real game (selftest-monomod-jit-reentry-crash) exits 6 and names
+   the known upstream crash; and a launch with no mods at all (--no-mods) boots, quits by itself
+   and exits 0. The re-entry check goes red when the Harmony mod ships a Harmony without the bug
+   (3.0.0-rc.5 or later): then the known-crash entry in run-scenarios can go.
+Extra arguments go to scripts/run-scenarios.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FIXTURES = os.path.join(HERE, "fixtures")
+
+
+def load_runner():
+    loader = importlib.machinery.SourceFileLoader("run_scenarios", os.path.join(HERE, "run-scenarios"))
+    spec = importlib.util.spec_from_loader("run_scenarios", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+failures = []
+
+
+def check(cond, msg):
+    print(("ok   " if cond else "FAIL ") + msg)
+    if not cond:
+        failures.append(msg)
+
+
+def fixture(name):
+    with open(os.path.join(FIXTURES, name), encoding="utf-8") as f:
+        return f.read()
+
+
+def fixture_checks(runner):
+    frames, known = runner.read_crash(fixture("coredump-monomod-jit-reentry.txt"))
+    check(frames and "ILStubResolver" in frames[0], "MonoMod re-entry dump: the top frame is ILStubResolver::ResolveToken (got %r)" % frames[:1])
+    check(known is not None and "orum/rimhunter#28" in known and "3.0.0-rc.3" in known,
+          "MonoMod re-entry dump: named as the known Harmony 3.0.0-rc.3 crash (got %r)" % known)
+    frames, known = runner.read_crash(fixture("coredump-gc-plan-phase.txt"))
+    check(frames and "plan_phase" in frames[0], "GC dump: the top frame is gc_heap::plan_phase (got %r)" % frames[:1])
+    check(known is None, "GC dump: not named as a known crash (got %r)" % known)
+    frames, known = runner.read_crash("")
+    check(frames == [] and known is None, "no dump text: no frames, not known")
+
+
+def launch(extra):
+    proc = subprocess.run([os.path.join(HERE, "run-scenarios")] + extra, capture_output=True, text=True)
+    out = proc.stdout + proc.stderr
+    print("  run-scenarios %s -> exit %d" % (" ".join(extra), proc.returncode))
+    return proc.returncode, out
+
+
+def game_checks(extra):
+    rc, out = launch(["--no-mod-under-test", "-s", "selftest-native-crash"] + extra)
+    check(rc == 2, "native crash launch exits 2 (got %d)" % rc)
+    check("game exited with signal SIGABRT" in out, "native crash launch: the game died of SIGABRT")
+    check("crashing thread" in out and "abort" in out, "native crash launch: prints the crashing thread's frames from the core dump")
+    check("KNOWN UPSTREAM CRASH" not in out, "native crash launch: not named as the known upstream crash")
+    rc, out = launch(["--no-mod-under-test", "-s", "selftest-monomod-jit-reentry-crash"] + extra)
+    check(rc == 6, "MonoMod re-entry launch exits 6 (got %d)" % rc)
+    check("game exited with signal SIGSEGV" in out, "MonoMod re-entry launch: the game died of SIGSEGV")
+    check("#0  _ZN14ILStubResolver12ResolveToken" in out, "MonoMod re-entry launch: the crashing frame is ILStubResolver::ResolveToken")
+    check("KNOWN UPSTREAM CRASH (orum/rimhunter#28)" in out, "MonoMod re-entry launch: named as the known upstream crash")
+    rc, out = launch(["--no-mods"] + [a for a in extra if a != "--no-build"])
+    check(rc == 0, "--no-mods launch exits 0 (got %d)" % rc)
+    check("quit by itself" in out, "--no-mods launch: the game booted and quit by itself")
+    if failures:
+        print(out)
+
+
+def main():
+    args = sys.argv[1:]
+    no_game = "--no-game" in args
+    args = [a for a in args if a != "--no-game"]
+    fixture_checks(load_runner())
+    if not no_game:
+        game_checks(args)
+    print("OVERALL: " + ("PASS" if not failures else "FAIL (%d)" % len(failures)))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

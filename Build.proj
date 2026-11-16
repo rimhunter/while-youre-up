@@ -1,0 +1,31 @@
+<Project DefaultTargets="Build">
+    <PropertyGroup>
+        <ModProject>$(MSBuildThisFileDirectory)Source/WhileYoureUp.csproj</ModProject>
+        <RunnerProject>$(MSBuildThisFileDirectory)TestRunner/Source/WyuTestRunner.csproj</RunnerProject>
+    </PropertyGroup>
+    <ItemGroup>
+        <GameVersion Include="1.6"/>
+        <GameVersion Include="1.7"/>
+    </ItemGroup>
+
+    <Target Name="Restore">
+        <MSBuild Projects="$(ModProject)" Targets="Restore"
+                 Properties="GameVersion=%(GameVersion.Identity);BaseIntermediateOutputPath=$(MSBuildThisFileDirectory)obj/%(GameVersion.Identity)/;MSBuildRestoreSessionId=$([System.Guid]::NewGuid())"/>
+        <MSBuild Projects="$(RunnerProject)" Targets="Restore"
+                 Properties="GameVersion=%(GameVersion.Identity);BaseIntermediateOutputPath=$(MSBuildThisFileDirectory)TestRunner/obj/%(GameVersion.Identity)/;MSBuildRestoreSessionId=$([System.Guid]::NewGuid())"/>
+    </Target>
+
+    <Target Name="Build">
+        <MSBuild Projects="$(ModProject)" Targets="Build"
+                 Properties="Configuration=Release;GameVersion=%(GameVersion.Identity);BaseIntermediateOutputPath=$(MSBuildThisFileDirectory)obj/%(GameVersion.Identity)/"/>
+        <MSBuild Projects="$(RunnerProject)" Targets="Build"
+                 Properties="GameVersion=%(GameVersion.Identity);BaseIntermediateOutputPath=$(MSBuildThisFileDirectory)TestRunner/obj/%(GameVersion.Identity)/"/>
+    </Target>
+
+    <Target Name="Clean">
+        <MSBuild Projects="$(ModProject)" Targets="Clean"
+                 Properties="Configuration=Release;GameVersion=%(GameVersion.Identity);BaseIntermediateOutputPath=$(MSBuildThisFileDirectory)obj/%(GameVersion.Identity)/"/>
+        <MSBuild Projects="$(RunnerProject)" Targets="Clean"
+                 Properties="GameVersion=%(GameVersion.Identity);BaseIntermediateOutputPath=$(MSBuildThisFileDirectory)TestRunner/obj/%(GameVersion.Identity)/"/>
+    </Target>
+</Project>

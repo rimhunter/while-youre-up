@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SettingsBlock>
+	<ModSettings Class="WhileYoureUp.Mod+Settings">
+		<Opportunity_PathChecker>Vanilla</Opportunity_PathChecker>
+		<Opportunity_MaxStartToThing>77</Opportunity_MaxStartToThing>
+		<HaulBeforeCarry_Bills>True</HaulBeforeCarry_Bills>
+		<Enabled>True</Enabled>
+	</ModSettings>
+</SettingsBlock>

@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>netstandard2.0</TargetFramework>
+        <AssemblyName>PickUpAndHaul</AssemblyName>
+        <RootNamespace>PickUpAndHaul</RootNamespace>
+        <Nullable>disable</Nullable>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <OutputPath>$(MSBuildProjectDirectory)/../Fixtures/puah-stub/Assemblies/</OutputPath>
+        <BaseIntermediateOutputPath>$(MSBuildProjectDirectory)/../obj/stub-puah/</BaseIntermediateOutputPath>
+        <GenerateDependencyFile>false</GenerateDependencyFile>
+        <DebugType>none</DebugType>
+    </PropertyGroup>
+</Project>

@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Proves scripts/run-scenarios owns the game's lifetime (orum/rimhunter#8).
+
+For SIGTERM and SIGKILL of the runner: starts a run, waits for the game process (a child of the
+runner this script started), signals only that runner, then requires the game PID gone and the
+game lock free. A game left alive is stopped here by its PID, which this script started.
+Extra arguments go to scripts/run-scenarios.
+"""
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "rimhunter-runner")
+LOCK = os.environ.get("RIMWORLD_GAME_LOCK", os.path.join(CACHE, "game.lock"))
+
+
+def children(pid):
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry) as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[1]) == pid:
+            out.append(int(entry))
+    return out
+
+
+def alive(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def group_alive(pgid):
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry) as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[2]) == pgid and fields[0] != "Z":
+            return True
+    return False
+
+
+def lock_is_free():
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def case(sig, extra):
+    runner = subprocess.Popen([os.path.join(HERE, "run-scenarios"), "-s", "selftest-hold"] + extra,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    game = None
+    deadline = time.time() + 150
+    while game is None and time.time() < deadline and runner.poll() is None:
+        for pid in children(runner.pid):
+            try:
+                with open("/proc/%d/comm" % pid) as f:
+                    if f.read().strip() in ("RimWorld", "RimWorldLinux"):
+                        game = pid
+            except OSError:
+                pass
+        time.sleep(0.5)
+    if game is None:
+        runner.kill()
+        runner.wait()
+        return False, "the game never appeared as a child of the runner"
+    time.sleep(3)
+    runner.send_signal(sig)
+    runner.wait()
+    leaked_lock = alive(game) and lock_is_free()
+    deadline = time.time() + 10
+    while alive(game) and time.time() < deadline:
+        time.sleep(0.5)
+    game_gone = not alive(game)
+    if not game_gone:
+        os.kill(game, signal.SIGKILL)
+        time.sleep(2)
+    lock_free = lock_is_free() or not group_alive(game)
+    return game_gone and lock_free and not leaked_lock, "lock free while the game was alive: %s, runner exit %s, game gone: %s, lock released after the game exited (free, or taken by a waiting launch while nothing of the game's group is alive): %s" % (leaked_lock, runner.returncode, game_gone, lock_free)
+
+
+def main():
+    extra = sys.argv[1:]
+    bad = False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        ok, detail = case(sig, extra)
+        print("%s %s: %s" % ("PASS" if ok else "FAIL", sig.name, detail))
+        bad |= not ok
+        extra = [a for a in extra if a != "--no-build"] + ["--no-build"]
+    print("OVERALL: " + ("FAIL" if bad else "PASS"))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

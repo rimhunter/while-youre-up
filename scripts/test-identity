@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$here"
+fail=0
+check() { if "${@:2}" >/dev/null 2>&1; then echo "PASS $1"; else echo "FAIL $1"; fail=1; fi; }
+
+about_ok() {
+  python3 -I - About/About.xml <<'PY'
+import sys, xml.etree.ElementTree as ET
+r = ET.parse(sys.argv[1]).getroot()
+t = lambda p: r.findtext(p)
+assert t("name") == "While You're Up (rimhunter)"
+assert t("packageId") == "rimhunter.whileyoureup"
+assert t("author") == "CodeOptimist (Christopher Galpin), rimhunter"
+assert t("modVersion") == "4.1.0"
+assert [e.text for e in r.findall("supportedVersions/li")] == ["1.6", "1.7"]
+assert [e.findtext("packageId") for e in r.findall("modDependencies/li")] == ["brrainz.harmony"]
+assert sorted(e.text for e in r.findall("incompatibleWith/li")) == sorted(
+    ["CodeOptimist.JobsOfOpportunity", "zsbk.patch16.whileyoureup", "hoodie.whileyoureup", "kevlou127.WhileHYouOreHUpHQ1V0S"])
+PY
+}
+unchanged() { git show "v4.0.4:$1" | cmp - "$1"; }
+modifications_ok() { grep -qxF "Modifications Copyright 2026 rimhunter, under the GNU AGPL v3 or later" MODIFICATIONS; }
+changelog_ok() {
+  grep -qE '^- [0-9]{4}-[0-9]{2}-[0-9]{2}: ' CHANGELOG.md &&
+  grep -q 'Anarchoped' CHANGELOG.md &&
+  grep -q 'v4.0.4' CHANGELOG.md &&
+  grep -qE '^## (Unreleased|[0-9]+\.[0-9]+\.[0-9]+ \([0-9]{4}-[0-9]{2}-[0-9]{2}\))' CHANGELOG.md
+}
+license_line_ok() {
+  grep -q 'License_Notice' Source/Settings.cs &&
+  grep -q 'CodeOptimist.WhileYoureUp_License_Notice' Languages/English/Keyed/Keys.xml
+}
+workshop_ok() {
+  local f=WORKSHOP.md
+  grep -q 'leaves it alone' $f && ! grep -q 'Continued and Reworked are supported' $f &&
+  grep -q 'Continuation of "While You' $f &&
+  grep -q 'No donations are accepted' $f &&
+  grep -qi 'Multiplayer' $f && grep -qi 'untested' $f &&
+  grep -q '2034960453' $f && grep -qi 'unsubscribe' $f &&
+  grep -q 'zsbk.patch16.whileyoureup\|1.6 patch' $f &&
+  grep -q "taken down or handed back at the original author's request" $f
+}
+languages_kept() {
+  local w="${RIMWORLD_WORKSHOP_DIR:-$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/workshop/content/294100}/2034960453"
+  [ -d "$w" ] || return 1
+  for d in $(ls "$w/1.5/Languages"); do [ -d "Languages/$d" ] || return 1; done
+  python3 -I - "$w/1.5/Languages/English/Keyed/Keys.xml" Languages/English/Keyed/Keys.xml <<'PY'
+import sys, xml.etree.ElementTree as ET
+keys = lambda p: {e.tag: e.text for e in ET.parse(p).getroot()}
+orig, ours = keys(sys.argv[1]), keys(sys.argv[2])
+assert all(ours.get(k) == v for k, v in orig.items())
+PY
+}
+package_ok() {
+  local out rc=0; out="$(mktemp -d)"
+  package_check "$out" || rc=1
+  rm -rf "$out"
+  return $rc
+}
+package_check() {
+  local out="$1"
+  scripts/package --no-build "$out/pkg" >/dev/null || return 1
+  for p in About/About.xml LoadFolders.xml 1.6/Assemblies/WhileYoureUp.dll 1.7/Assemblies/WhileYoureUp.dll \
+           Languages/English/Keyed/Keys.xml LICENSE NOTICE MODIFICATIONS CHANGELOG.md Source/Mod.cs Source/WhileYoureUp.csproj; do
+    [ -f "$out/pkg/$p" ] || { echo "missing $p"; return 1; }
+  done
+  for p in TestRunner Tests scripts obj bin .git .gitea WORKSHOP.md; do [ -e "$out/pkg/$p" ] && { echo "unexpected $p"; return 1; }; done
+  [ -z "$(find "$out/pkg/Source" \( -name bin -o -name obj \) -type d)" ] || return 1
+}
+
+check "About.xml identity" about_ok
+check "LICENSE unchanged from v4.0.4" unchanged LICENSE
+check "NOTICE unchanged from v4.0.4" unchanged NOTICE
+check "modifications notice" modifications_ok
+check "CHANGELOG dated, credits Anarchoped" changelog_ok
+check "settings window license line" license_line_ok
+check "Workshop page text" workshop_ok
+check "original languages and keys kept" languages_kept
+check "package folder contents" package_ok
+exit $fail

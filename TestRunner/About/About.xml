@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ModMetaData>
+    <name>While You're Up scenario runner (test only)</name>
+    <author>rimhunter</author>
+    <packageId>rimhunter.whileyoureup.testrunner</packageId>
+    <modVersion>1.0.0</modVersion>
+    <supportedVersions>
+        <li>1.6</li>
+        <li>1.7</li>
+    </supportedVersions>
+    <loadAfter>
+        <li>rimhunter.whileyoureup</li>
+    </loadAfter>
+    <description>Test-only companion mod. Never shipped. Runs scenarios on fresh maps and writes a result file; launch it with scripts/run-scenarios.</description>
+</ModMetaData>

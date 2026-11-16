@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fx="$here/TestRunner/Fixtures/settings-import"
+run="$here/scripts/run-scenarios"
+work="$(mktemp -d "${TMPDIR:-/tmp}/wyu-import.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+own="Mod_rimhunter.whileyoureup_Mod.xml"
+
+case_copies()    { "$run" "$@" -s settings-import-copies-original-values --work-dir "$work/copies" --seed-config "$fx/original.xml:Mod_2034960453_Mod.xml"; }
+case_local()     { "$run" "$@" -s settings-import-from-local-copy --work-dir "$work/local" --seed-config "$fx/local-copy.xml:Mod_WhileYoureUpLocal_Mod.xml"; }
+case_prefers()   { "$run" "$@" -s settings-import-prefers-workshop-original --work-dir "$work/prefers" --seed-config "$fx/local-copy.xml:Mod_WhileYoureUpLocal_Mod.xml" --seed-config "$fx/original.xml:Mod_2034960453_Mod.xml"; }
+case_missing()   { "$run" "$@" -s settings-import-missing-original-is-silent --work-dir "$work/missing"; }
+case_unreadable(){ "$run" "$@" -s settings-import-unreadable-original-is-an-error --work-dir "$work/unreadable" --seed-config "$fx/unreadable.xml:Mod_2034960453_Mod.xml"; }
+case_unrelated() { "$run" "$@" -s settings-import-skips-an-unrelated-unreadable-file --work-dir "$work/unrelated" --seed-config "$fx/local-copy.xml:Mod_WhileYoureUpLocal_Mod.xml" --seed-unreadable-config Mod_SomeOtherMod_Mod.xml; }
+case_once() {
+  "$run" "$@" -s settings-import-never-runs-again --work-dir "$work/once" \
+    --seed-config "$fx/original-changed-later.xml:Mod_2034960453_Mod.xml" --seed-config "$fx/recorded-import.xml:$own"
+}
+
+cases="copies local prefers missing unreadable unrelated once"
+if [ "${1:-}" = "--cases" ]; then echo $cases; exit 0; fi
+which="${1:-all}"; shift || true
+case "$which" in
+  copies) case_copies "$@";; local) case_local "$@";; prefers) case_prefers "$@";;
+  unrelated) case_unrelated "$@";; missing) case_missing "$@";; unreadable) case_unreadable "$@";; once) case_once "$@";;
+  all) for c in $cases; do echo "== $c"; "case_$c" "$@"; done;;
+  *) echo "usage: $0 [copies|local|prefers|missing|unreadable|unrelated|once|all] [run-scenarios options]" >&2; exit 4;;
+esac

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+build=1
+if [ "${1:-}" = "--no-build" ]; then build=0; shift; fi
+out="${1:-$here/dist/rimhunter.whileyoureup}"
+
+if [ "$build" = 1 ]; then
+  "$HOME/.dotnet/dotnet" build "$here/Build.proj" >&2
+fi
+
+for v in 1.6 1.7; do
+  [ -f "$here/$v/Assemblies/WhileYoureUp.dll" ] || { echo "package: $v/Assemblies/WhileYoureUp.dll is missing; build first" >&2; exit 4; }
+done
+[ ! -e "$here/About/PublishedFileId.txt" ] || { echo "package: About/PublishedFileId.txt would point the uploader at an existing Workshop page; remove it" >&2; exit 4; }
+
+case "$out" in ""|/|"$HOME"|"$here") echo "package: refusing output folder '$out'" >&2; exit 4;; esac
+rm -rf "$out"
+mkdir -p "$out"
+
+cp -r "$here/About" "$here/Languages" "$out/"
+cp "$here/LoadFolders.xml" "$here/LICENSE" "$here/NOTICE" "$here/MODIFICATIONS" "$here/CHANGELOG.md" "$out/"
+for v in 1.6 1.7; do
+  mkdir -p "$out/$v/Assemblies"
+  cp "$here/$v/Assemblies/WhileYoureUp.dll" "$out/$v/Assemblies/"
+done
+mkdir -p "$out/Source"
+(cd "$here/Source" && find . \( -name bin -o -name obj \) -prune -o -type f -print0 | xargs -0 cp --parents -t "$out/Source")
+
+(cd "$out" && find . -type f | sort | sed 's|^\./||')

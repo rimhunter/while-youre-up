@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""Launch RimWorld (1.6 Unity or 1.7 Waylith) unattended on this host, run scenarios, report pass/fail.
+
+Exit codes: 0 all selected scenarios passed; 1 a scenario failed; 2 the game did
+not start or died without a complete result file; 3 the game did not quit in time;
+4 setup or usage error (including a failed build); 5 Chris's RimWorld user data changed;
+6 the game crashed in a known upstream bug, named in the output (orum/rimhunter#28);
+128 plus the signal number when the runner itself was signaled (the game is stopped first).
+"""
+import argparse
+import ctypes
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+REPO = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+HOME = os.path.expanduser("~")
+STEAM = os.path.join(HOME, ".var/app/com.valvesoftware.Steam/.local/share/Steam")
+DEFAULT_GAME = os.path.join(STEAM, "steamapps/common/RimWorld")
+DEFAULT_WORKSHOP = os.path.join(STEAM, "steamapps/workshop/content/294100")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "rimhunter-runner")
+DEFAULT_LOCK = os.path.join(CACHE, "game.lock")
+DEFAULT_WORK = CACHE
+USERDATA_ROOTS = [
+    os.path.join(HOME, ".var/app/com.valvesoftware.Steam/.config/unity3d/Ludeon Studios"),
+    os.path.join(HOME, ".config/unity3d/Ludeon Studios"),
+]
+KNOWN_EXPANSIONS = [
+    "ludeon.rimworld.royalty",
+    "ludeon.rimworld.ideology",
+    "ludeon.rimworld.biotech",
+    "ludeon.rimworld.anomaly",
+]
+HARMONY_ID = "2009463077"
+MOD_ALIASES = {
+    "puah-mehni": "1279012058",
+    "puah-continued": "3829549663",
+    "puah-reworked": "3813653998",
+}
+WYU_PACKAGE = "rimhunter.whileyoureup"
+RUNNER_PACKAGE = "rimhunter.whileyoureup.testrunner"
+STAGE_IGNORE = shutil.ignore_patterns(
+    ".git", "Source", "Tests", "TestRunner", "scripts", "obj", "*.proj", "*.pdb", "global.json",
+    "*.yaml", "_PublisherPlus.xml", "LICENSE", "NOTICE", ".gitignore", ".gitea")
+
+GAME_LINES = {
+    "1.6": {"exe": "RimWorldLinux"},
+    "1.7": {"exe": "RimWorld"},
+}
+
+SHARE_WIDTH, SHARE_COLORS = 1152, 128
+EXIT_PASS, EXIT_FAIL, EXIT_NO_START, EXIT_TIMEOUT, EXIT_SETUP, EXIT_USERDATA, EXIT_KNOWN_CRASH = 0, 1, 2, 3, 4, 5, 6
+
+
+class SetupError(Exception):
+    pass
+
+
+class Interrupted(BaseException):
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def raise_interrupted(signum, frame):
+    raise Interrupted(signum)
+
+
+def die_with_parent():
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="run-scenarios",
+        description="Run in-game scenarios against this host's RimWorld, 1.6 or 1.7 (see docs/testing.md).")
+    p.add_argument("-s", "--scenario", action="append", default=[], metavar="NAME",
+                   help="scenario to run (repeatable, or comma separated); default: every non-selftest scenario")
+    p.add_argument("--list", action="store_true", help="list scenario names found in TestRunner/Source and exit")
+    p.add_argument("--list-json", action="store_true", help="print the scenarios (name, selftest, required mods) and the PUAH fork aliases as JSON and exit")
+    p.add_argument("--mod", action="append", default=[], metavar="SPEC",
+                   help="extra mod, loaded after Harmony and before the mod under test: alias (%s), "
+                        "a Workshop id, or a path to a mod folder; prefix with 'after:' to load it after the mod under test"
+                        % ", ".join(sorted(MOD_ALIASES)))
+    p.add_argument("--stage-mod", action="append", default=[], metavar="SPEC",
+                   help="put a mod (alias, Workshop id or folder) in the launch's Mods folder without activating it, "
+                        "so a scenario can enable it on the game's own mod page")
+    p.add_argument("--language", metavar="FOLDER", help="language folder name, e.g. 'Spanish (Español)'")
+    p.add_argument("--seed-config", action="append", default=[], metavar="SRC[:NAME]",
+                   help="copy SRC into the launch's Config folder before the game starts (as NAME if given)")
+    p.add_argument("--seed-unreadable-config", action="append", default=[], metavar="NAME",
+                   help="create an empty NAME in the launch's Config folder with no permissions, so reading it fails")
+    p.add_argument("--no-mod-under-test", action="store_true",
+                   help="leave the mod under test out of the launch (Harmony, extra mods and the runner only)")
+    p.add_argument("--no-mods", action="store_true",
+                   help="launch the game with no mods at all (no Harmony, no runner, no mod under test) and let it quit "
+                        "by itself after the quick-test map (-QuitAfterBoot, 1.7 only); runs no scenarios and checks only "
+                        "that the game boots and quits cleanly")
+    p.add_argument("--game-env", action="append", default=[], metavar="NAME=VALUE",
+                   help="extra environment variable for the game process (repeatable), e.g. DOTNET_* or MONOMOD_* debug knobs; "
+                        "the game otherwise starts with a clean environment")
+    p.add_argument("--mod-folder-name", default=WYU_PACKAGE,
+                   help="folder name of the mod under test; mod settings files are named after it (default %(default)s)")
+    p.add_argument("--timeout", type=int, default=170, help="seconds the game may run before it is stopped (default %(default)s)")
+    p.add_argument("--lock-wait", type=int, default=900, help="seconds to wait for the game lock (default %(default)s)")
+    p.add_argument("--result-file", metavar="PATH", help="where to write the result JSON (default: in the run folder)")
+    p.add_argument("--no-build", action="store_true", help="do not build the mod and the runner first")
+    p.add_argument("--windowed", action="store_true", help="open a window on the Wayland session instead of running headless")
+    p.add_argument("--save-screenshots", metavar="DIR",
+                   help="also save every screenshot to DIR, scaled to %d pixels wide with a %d color palette so it can be attached (needs Pillow)"
+                        % (SHARE_WIDTH, SHARE_COLORS))
+    p.add_argument("--keep-game-farm", action="store_true", help="keep the private game folder after the run")
+    p.add_argument("--work-dir", default=os.environ.get("RIMHUNTER_RUNNER_WORK", DEFAULT_WORK))
+    p.add_argument("--game-dir", default=os.environ.get("RIMWORLD_DIR", DEFAULT_GAME))
+    p.add_argument("--workshop-dir", default=os.environ.get("RIMWORLD_WORKSHOP_DIR", DEFAULT_WORKSHOP))
+    p.add_argument("--lock-file", default=os.environ.get("RIMWORLD_GAME_LOCK", DEFAULT_LOCK))
+    return p.parse_args()
+
+
+def read_game_version(game_dir):
+    path = os.path.join(game_dir, "Version.txt")
+    if not os.path.isfile(path):
+        fail_setup("RimWorld not found at %s (set --game-dir or RIMWORLD_DIR)" % game_dir)
+    with open(path) as f:
+        version = f.read().strip()
+    line = next((l for l in GAME_LINES if version.startswith(l + ".")), None)
+    if line is None:
+        fail_setup("RimWorld at %s is %s; this runner launches %s" % (game_dir, version, " or ".join(GAME_LINES)))
+    return version, line
+
+
+def scenario_catalog(game_line):
+    found = []
+    for path in glob.glob(os.path.join(REPO, "TestRunner/Source/**/*.cs"), recursive=True):
+        with open(path, encoding="utf-8-sig") as f:
+            for m in re.finditer(r'\[Scenario\(\s*"([^"]+)"([^\]]*)\)\]', f.read()):
+                mods = re.search(r'\bMods\s*=\s*"([^"]*)"', m.group(2))
+                staged = re.search(r'\bStageMods\s*=\s*"([^"]*)"', m.group(2))
+                only_on = re.search(r'\bOnlyOn\s*=\s*"([^"]*)"', m.group(2))
+                on_unity = "WindowedOnUnity = true" in m.group(2)
+                found.append({"name": m.group(1), "selftest": "SelfTest = true" in m.group(2),
+                              "windowed": "Windowed = true" in m.group(2) or (on_unity and game_line == "1.6"),
+                              "windowed_on_unity": on_unity,
+                              "only_on": only_on.group(1) if only_on else None,
+                              "mods": mods.group(1).split() if mods else [],
+                              "stage_mods": staged.group(1).split() if staged else []})
+    return sorted(found, key=lambda s: s["name"])
+
+
+def fail_setup(msg):
+    raise SetupError(msg)
+
+
+def build(args, run_dir):
+    dotnet = os.environ.get("DOTNET", os.path.join(HOME, ".dotnet/dotnet"))
+    if not os.path.exists(dotnet):
+        fail_setup("dotnet not found at %s (set DOTNET)" % dotnet)
+    line = args.game_line
+    for proj, obj, config in (("Source/WhileYoureUp.csproj", "obj/%s/" % line, "Release"), ("TestRunner/Source/WyuTestRunner.csproj", "TestRunner/obj/%s/" % line, "Debug")):
+        log = os.path.join(run_dir, "build-%s.log" % os.path.basename(proj))
+        with open(log, "w") as out:
+            rc = subprocess.run(
+                [dotnet, "build", os.path.join(REPO, proj), "-c", config, "-p:GameVersion=" + line,
+                 "-p:BaseIntermediateOutputPath=%s/" % os.path.join(REPO, obj).rstrip("/"), "-nologo", "-v:q"],
+                cwd=REPO, stdout=out, stderr=subprocess.STDOUT,
+                env=dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_NOLOGO="1")).returncode
+        if rc != 0:
+            with open(log) as f:
+                tail = "".join(f.readlines()[-30:])
+            fail_setup("build of %s failed (log %s):\n%s" % (proj, log, tail))
+
+
+def package_id(mod_dir):
+    about = os.path.join(mod_dir, "About", "About.xml")
+    if not os.path.isfile(about):
+        fail_setup("mod folder %s has no About/About.xml" % mod_dir)
+    node = ET.parse(about).getroot().find("packageId")
+    if node is None or not (node.text or "").strip():
+        fail_setup("%s has no packageId" % about)
+    return node.text.strip().lower()
+
+
+def resolve_extra(spec, workshop_dir):
+    after = spec.startswith("after:")
+    spec = spec[len("after:"):] if after else spec
+    spec = MOD_ALIASES.get(spec, spec)
+    path = spec if os.path.isdir(spec) else os.path.join(workshop_dir, spec)
+    if not os.path.isdir(path):
+        fail_setup("extra mod '%s' is neither a folder nor a Workshop id under %s" % (spec, workshop_dir))
+    return after, os.path.realpath(path)
+
+
+def stage_mods(args, farm, wyu_name):
+    mods = os.path.join(farm, "Mods")
+    os.makedirs(mods)
+    if args.no_mods:
+        return ["ludeon.rimworld"]
+    harmony_src = os.path.join(args.workshop_dir, HARMONY_ID)
+    if not os.path.isdir(harmony_src):
+        fail_setup("Harmony (Workshop %s) not found in %s" % (HARMONY_ID, args.workshop_dir))
+    os.symlink(harmony_src, os.path.join(mods, HARMONY_ID))
+    before, after = [], []
+    used = {HARMONY_ID, wyu_name, RUNNER_PACKAGE}
+    for spec in args.stage_mod:
+        _, path = resolve_extra(spec, args.workshop_dir)
+        name = os.path.basename(path)
+        if name in used:
+            fail_setup("staged mod folder name '%s' collides with another mod in this launch" % name)
+        used.add(name)
+        package_id(path)
+        os.symlink(path, os.path.join(mods, name))
+    for spec in args.mod:
+        is_after, path = resolve_extra(spec, args.workshop_dir)
+        name = os.path.basename(path)
+        if name in used:
+            fail_setup("extra mod folder name '%s' collides with another mod in this launch" % name)
+        used.add(name)
+        os.symlink(path, os.path.join(mods, name))
+        (after if is_after else before).append(package_id(path))
+    wyu_dir = os.path.join(mods, wyu_name)
+    if not args.no_mod_under_test:
+        shutil.copytree(REPO, wyu_dir, ignore=STAGE_IGNORE, symlinks=False)
+    runner_dir = os.path.join(mods, RUNNER_PACKAGE)
+    shutil.copytree(os.path.join(REPO, "TestRunner"), runner_dir,
+                    ignore=shutil.ignore_patterns("Source", "obj", "*.pdb", *[l for l in GAME_LINES if l != args.game_line]))
+    needed = [os.path.join(runner_dir, args.game_line, "Assemblies/WyuTestRunner.dll")]
+    if not args.no_mod_under_test:
+        needed.append(os.path.join(wyu_dir, args.game_line, "Assemblies/WhileYoureUp.dll"))
+    for need in needed:
+        if not os.path.isfile(need):
+            fail_setup("missing build output %s (run without --no-build)" % os.path.relpath(need, farm))
+    wyu = []
+    if not args.no_mod_under_test:
+        wyu_id = package_id(wyu_dir)
+        if wyu_id != WYU_PACKAGE:
+            fail_setup("mod under test has packageId %s, expected %s" % (wyu_id, WYU_PACKAGE))
+        wyu = [wyu_id]
+    return ["brrainz.harmony", "ludeon.rimworld"] + before + wyu + after + [RUNNER_PACKAGE]
+
+
+def build_farm(args, farm, wyu_name):
+    os.makedirs(farm)
+    exe = GAME_LINES[args.game_line]["exe"]
+    for entry in os.listdir(args.game_dir):
+        if entry in (exe, "Mods"):
+            continue
+        os.symlink(os.path.join(args.game_dir, entry), os.path.join(farm, entry))
+    shutil.copy2(os.path.join(args.game_dir, exe), os.path.join(farm, exe))
+    return stage_mods(args, farm, wyu_name)
+
+
+def seed_config(args, savedata, active, game_version):
+    cfg = os.path.join(savedata, "Config")
+    os.makedirs(cfg)
+    with open(os.path.join(cfg, "ModsConfig.xml"), "w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n<ModsConfigData>\n  <version>%s</version>\n  <activeMods>\n' % game_version)
+        for pid in active:
+            f.write("    <li>%s</li>\n" % pid)
+        f.write("  </activeMods>\n  <knownExpansions>\n")
+        for pid in KNOWN_EXPANSIONS:
+            f.write("    <li>%s</li>\n" % pid)
+        f.write("  </knownExpansions>\n</ModsConfigData>\n")
+    if args.language:
+        with open(os.path.join(cfg, "Prefs.xml"), "w", encoding="utf-8") as f:
+            f.write('<?xml version="1.0" encoding="utf-8"?>\n<PrefsData>\n  <langFolderName>%s</langFolderName>\n</PrefsData>\n' % args.language)
+    for spec in args.seed_config:
+        src, _, name = spec.partition(":")
+        if not os.path.isfile(src):
+            fail_setup("--seed-config file %s does not exist" % src)
+        dest = os.path.join(cfg, name or os.path.basename(src))
+        if os.path.exists(dest):
+            fail_setup("--seed-config would overwrite %s" % dest)
+        shutil.copy2(src, dest)
+    for name in args.seed_unreadable_config:
+        dest = os.path.join(cfg, name)
+        if os.path.exists(dest):
+            fail_setup("--seed-unreadable-config would overwrite %s" % dest)
+        open(dest, "w").close()
+        os.chmod(dest, 0)
+
+
+def userdata_snapshot():
+    snap = {}
+    for root in USERDATA_ROOTS:
+        if not os.path.exists(root):
+            snap[root] = "absent"
+            continue
+        for d, dirs, files in os.walk(root):
+            dirs.sort()
+            for name in sorted(files):
+                path = os.path.join(d, name)
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                snap[path] = h.hexdigest()
+            for name in dirs:
+                snap[os.path.join(d, name) + "/"] = "dir"
+    return snap
+
+
+def diff_snapshots(before, after):
+    out = []
+    for k in sorted(set(before) | set(after)):
+        if before.get(k) != after.get(k):
+            out.append("%s: %s -> %s" % (k, before.get(k, "missing"), after.get(k, "missing")))
+    return out
+
+
+def acquire_lock(path, wait):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() > deadline:
+                os.close(fd)
+                fail_setup("could not get the game lock %s within %d s: another launch holds it" % (path, wait))
+            time.sleep(2)
+
+
+def launch(args, farm, savedata, xdg, run_dir, result_file, player_log, selected, lock_fd, screenshot_dir):
+    env = {
+        "HOME": HOME,
+        "USER": os.environ.get("USER", ""),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "XDG_RUNTIME_DIR": "/run/user/%d" % os.getuid(),
+        "XDG_CONFIG_HOME": os.path.join(xdg, "config"),
+        "XDG_CACHE_HOME": os.path.join(xdg, "cache"),
+        "XDG_DATA_HOME": os.path.join(xdg, "data"),
+        "WYU_RESULT_FILE": result_file,
+        "WYU_PLAYER_LOG": player_log,
+        "WYU_SCENARIOS": selected,
+        "WYU_SCREENSHOT_DIR": screenshot_dir,
+    }
+    exe = os.path.join(farm, GAME_LINES[args.game_line]["exe"])
+    if args.game_line == "1.7":
+        env["DOTNET_EnableWriteXorExecute"] = "0"  # MonoMod re-patching vs SELinux execheap: notes/25-tiered-jit.md
+        cmd = [exe, "-NoCrashDialog", "-quicktest", "-savedatafolder=" + savedata]
+        if args.no_mods:
+            cmd.append("-QuitAfterBoot")
+        if not args.windowed:
+            cmd.insert(1, "-Headless")
+    else:
+        os.makedirs(os.path.dirname(player_log), exist_ok=True)
+        cmd = [exe, "-logFile", player_log, "-quicktest", "-savedatafolder=" + savedata]
+        if args.windowed:
+            env["DISPLAY"] = ":0"
+            env["XAUTHORITY"] = xwayland_auth()
+        else:
+            cmd.insert(1, "-batchmode")  # a real GPU device and no window; -nographics breaks texture atlas loading
+    env.update(args.game_env_pairs)
+    out = open(os.path.join(run_dir, "game.stdout"), "w")
+    proc = subprocess.Popen(cmd, cwd=farm, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                            pass_fds=[lock_fd], preexec_fn=die_with_parent)
+    try:
+        proc.wait(timeout=args.timeout)
+        return proc.pid, proc.returncode, False
+    except (subprocess.TimeoutExpired, Interrupted) as stop:
+        stop_game(proc)
+        if isinstance(stop, Interrupted):
+            raise
+        return proc.pid, proc.returncode, True
+    finally:
+        out.close()
+
+
+def xwayland_auth():
+    found = glob.glob("/run/user/%d/.mutter-Xwaylandauth.*" % os.getuid())
+    if len(found) != 1:
+        fail_setup("a windowed 1.6 launch needs exactly one Xwayland cookie /run/user/%d/.mutter-Xwaylandauth.*, found %d" % (os.getuid(), len(found)))
+    return found[0]
+
+
+def stop_game(proc):
+    for sig, wait in ((signal.SIGTERM, 15), (signal.SIGKILL, None)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+ERROR_LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\s+(ERROR|FATAL|CRITICAL)\b")
+
+
+def print_log_errors(player_log, game_line, limit=5):
+    if not os.path.isfile(player_log):
+        print("no Player.log was written at " + player_log)
+        return
+    if game_line == "1.6":
+        with open(player_log, encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-20:]
+        print("Unity's Player.log has no error level per line; its last %d lines:" % len(tail))
+        for line in tail:
+            print("  Player.log: " + line.rstrip()[:400])
+        return
+    shown = 0
+    total = 0
+    with open(player_log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if ERROR_LINE.match(line):
+                total += 1
+                if shown < limit:
+                    print("  Player.log: " + line.strip()[:400])
+                    shown += 1
+    print("Player.log holds %d error line(s)" % total)
+
+
+def save_screenshots(result, dest):
+    from PIL import Image
+    os.makedirs(dest, exist_ok=True)
+    for s in result["scenarios"]:
+        for shot in s.get("screenshots", []):
+            out = os.path.join(dest, os.path.basename(shot))
+            with Image.open(shot) as im:
+                rgb = im.convert("RGB")
+                small = rgb.resize((SHARE_WIDTH, round(rgb.height * SHARE_WIDTH / rgb.width)), Image.LANCZOS)
+                small.quantize(colors=SHARE_COLORS, method=Image.Quantize.LIBIMAGEQUANT, dither=Image.Dither.NONE).save(out, optimize=True)
+            print("saved %s (%d KB)" % (out, os.path.getsize(out) // 1024))
+
+
+def describe_exit(rc):
+    if rc is not None and rc < 0:
+        try:
+            return "signal %s" % signal.Signals(-rc).name
+        except ValueError:
+            return "signal %d" % -rc
+    return "code %s" % rc
+
+
+FRAME_LINE = re.compile(r"^\s*#\d+\s+0x[0-9a-fA-F]+\s+(.*?)\s*$")
+MODULE_PATH = re.compile(r"\((?:[^()]*/)?([^/()]+)\)$")
+KNOWN_CRASHES = [
+    (lambda frames: "ILStubResolver" in frames[0] and "ResolveToken" in frames[0] and any("mm-exhelper" in f for f in frames),
+     "KNOWN UPSTREAM CRASH (orum/rimhunter#28): the JIT crashed compiling a P/Invoke IL stub that had already been "
+     "compiled and freed by a re-entrant compile on the same thread. The re-entry comes from the JIT hook of MonoMod.Core "
+     "1.3.6 inside Harmony 3.0.0-rc.3 (the Harmony mod's 1.7 build): before calling the JIT it creates a ThreadLocal slot "
+     "under a contended lock, and the spin-wait on that lock needs the very stub being compiled. Any launch with the Harmony "
+     "mod can hit it; the mod under test is not involved. Harmony 3.0.0-rc.5 no longer does this. Rerun the launch."),
+]
+
+
+def read_crash(info_text):
+    """Frames of the crashing thread from `coredumpctl info` text, and the known-crash explanation if it matches one."""
+    frames = []
+    in_first = False
+    for line in info_text.splitlines():
+        if "Stack trace of thread" in line:
+            if in_first:
+                break
+            in_first = True
+            continue
+        if in_first:
+            m = FRAME_LINE.match(line)
+            if m:
+                frames.append(MODULE_PATH.sub(lambda p: "(%s)" % p.group(1), m.group(1)))
+    known = next((text for match, text in KNOWN_CRASHES if frames and match(frames)), None)
+    return frames, known
+
+
+def core_dump_info(pid, since, wait=90):
+    coredumpctl = shutil.which("coredumpctl")
+    if coredumpctl is None:
+        return None, "coredumpctl is not installed, so the crash stack cannot be read"
+    deadline = time.time() + wait
+    while True:
+        p = subprocess.run([coredumpctl, "info", "--no-pager", "-1", "--since=@%d" % int(since), str(pid)],
+                           capture_output=True, text=True)
+        if p.returncode == 0 and "Stack trace of thread" in p.stdout:
+            return p.stdout, None
+        if time.time() > deadline:
+            return None, "coredumpctl has no core dump with a stack for game pid %d after %d s: %s" % (pid, wait, (p.stderr or p.stdout).strip()[:300])
+        time.sleep(2)
+
+
+def report_crash(pid, since, max_frames=12):
+    """Print the crashing thread's frames from the game's core dump; return the known-crash explanation if it matches one."""
+    info, problem = core_dump_info(pid, since)
+    if info is None:
+        print("cannot name the crash: " + problem)
+        return None
+    frames, known = read_crash(info)
+    print("crashing thread (coredumpctl info %d):" % pid)
+    for i, frame in enumerate(frames[:max_frames]):
+        print("  #%-2d %s" % (i, frame))
+    if known:
+        print(known)
+    return known
+
+
+def load_result(path):
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def report(result, expected_mods, requested):
+    exit_code = EXIT_PASS
+    for s in result["scenarios"]:
+        tag = "PASS" if s["status"] == "pass" else "FAIL"
+        print("%s %s (%d ms, %d ticks)" % (tag, s["name"], s["duration_ms"], s["ticks"]))
+        for shot in s.get("screenshots", []):
+            print("     screenshot: " + shot)
+        for msg in s["failures"]:
+            print("     - " + msg.replace("\n", "\n       "))
+        if s["status"] != "pass":
+            exit_code = EXIT_FAIL
+    if result.get("fatal"):
+        print("RUNNER FATAL: " + result["fatal"])
+        exit_code = EXIT_NO_START
+    if result["mods"] != expected_mods:
+        print("MOD LIST MISMATCH: expected %s but the game loaded %s" % (expected_mods, result["mods"]))
+        exit_code = max(exit_code, EXIT_NO_START)
+    if requested != "all":
+        ran = [s["name"] for s in result["scenarios"]]
+        missing = [n for n in requested.split(",") if n not in ran]
+        if missing:
+            print("scenarios requested but not run: " + ", ".join(missing))
+            exit_code = max(exit_code, EXIT_NO_START)
+    return exit_code
+
+
+def main():
+    signal.signal(signal.SIGTERM, raise_interrupted)
+    signal.signal(signal.SIGHUP, raise_interrupted)
+    signal.signal(signal.SIGINT, raise_interrupted)
+    args = parse_args()
+    game_version, args.game_line = read_game_version(args.game_dir)
+    catalog = scenario_catalog(args.game_line)
+    if args.list_json:
+        print(json.dumps({"scenarios": catalog, "game_line": args.game_line,
+                          "puah_forks": sorted(a for a in MOD_ALIASES if a.startswith("puah-"))}, indent=1))
+        return EXIT_PASS
+    if args.list:
+        for s in catalog:
+            notes = (["selftest"] if s["selftest"] else []) + (["windowed: run with --windowed"] if s["windowed"] else []) \
+                + (["draws GUI: needs a window on 1.6"] if s["windowed_on_unity"] else []) \
+                + (["only on " + s["only_on"]] if s["only_on"] else []) \
+                + (["needs mods: " + " ".join(s["mods"])] if s["mods"] else []) + (["stages mods: " + " ".join(s["stage_mods"])] if s["stage_mods"] else [])
+            excluded = s["selftest"] or s["windowed"] or s["mods"] or (s["only_on"] and s["only_on"] != args.game_line)
+            print(s["name"] + ("  (%s%s)" % ("; ".join(notes), "; not in 'all'" if excluded else "") if notes else ""))
+        return EXIT_PASS
+    selected = ",".join(n.strip() for spec in args.scenario for n in spec.split(",") if n.strip()) or "all"
+    if args.save_screenshots:
+        from PIL import features
+        if not features.check("libimagequant"):
+            fail_setup("--save-screenshots needs Pillow built with libimagequant (keeps the small colored lines and icons)")
+    args.game_env_pairs = {}
+    for spec in args.game_env:
+        name, sep, value = spec.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            fail_setup("--game-env needs NAME=VALUE, got %r" % spec)
+        args.game_env_pairs[name] = value
+    if args.no_mods:
+        if args.game_line != "1.7":
+            fail_setup("--no-mods needs RimWorld 1.7 (it quits the game with -QuitAfterBoot)")
+        if args.scenario or args.mod or args.stage_mod:
+            fail_setup("--no-mods runs no scenarios and loads no mods: drop -s, --mod and --stage-mod")
+    if not args.windowed:
+        needs_window = [s["name"] for s in catalog if s["windowed"] and s["name"] in selected.split(",")]
+        if needs_window:
+            fail_setup("these scenarios need a window on RimWorld %s, run them with --windowed: %s" % (args.game_line, ", ".join(needs_window)))
+
+    stamp = time.strftime("%Y%m%d-%H%M%S") + "-%d" % os.getpid()
+    run_dir = os.path.join(args.work_dir, "runs", stamp)
+    os.makedirs(run_dir)
+    result_file = os.path.abspath(args.result_file) if args.result_file else os.path.join(run_dir, "results.json")
+    if os.path.exists(result_file):
+        os.remove(result_file)
+    print("run folder: " + run_dir)
+
+    if not args.no_build and not args.no_mods:
+        build(args, run_dir)
+
+    lock_fd = acquire_lock(args.lock_file, args.lock_wait)
+    exit_code = EXIT_NO_START
+    try:
+        before = userdata_snapshot()
+        farm = os.path.join(run_dir, "game")
+        savedata = os.path.join(run_dir, "savedata")
+        xdg = os.path.join(run_dir, "xdg")
+        os.makedirs(xdg)
+        screenshot_dir = os.path.join(run_dir, "screenshots")
+        os.makedirs(screenshot_dir)
+        active = build_farm(args, farm, args.mod_folder_name)
+        seed_config(args, savedata, active, game_version)
+        player_log = os.path.join(xdg, "config/unity3d/Ludeon Studios/RimWorld by Ludeon Studios/Logs/Player.log")
+        started = time.time()
+        pid, rc, timed_out = launch(args, farm, savedata, xdg, run_dir, result_file, player_log, selected, lock_fd, screenshot_dir)
+        elapsed = time.time() - started
+        print("game exited with %s after %.1f s%s; Player.log: %s" % (describe_exit(rc), elapsed, " (TIMED OUT, stopped by the runner)" if timed_out else "", player_log))
+        known_crash = report_crash(pid, started) if rc is not None and rc < 0 and not timed_out else None
+        result = load_result(result_file)
+        if timed_out:
+            print("FAIL: the game did not quit within %d s" % args.timeout)
+            exit_code = EXIT_TIMEOUT
+        elif args.no_mods:
+            if rc == 0:
+                print("PASS: the game booted with no mods and quit by itself (-QuitAfterBoot)")
+                exit_code = EXIT_PASS
+            else:
+                print("FAIL: the game with no mods exited with %s" % describe_exit(rc))
+                print_log_errors(player_log, args.game_line)
+                exit_code = EXIT_NO_START
+        elif result is None:
+            print("FAIL: the game exited without writing a result file (%s); see game.stdout and Player.log in the run folder" % result_file)
+            print_log_errors(player_log, args.game_line)
+            exit_code = EXIT_NO_START
+        elif not result["complete"]:
+            print("FAIL: the result file is incomplete (the game stopped mid-run)")
+            report(result, active, selected)
+            print_log_errors(player_log, args.game_line)
+            exit_code = EXIT_NO_START
+        else:
+            exit_code = report(result, active, selected)
+            if args.save_screenshots:
+                save_screenshots(result, args.save_screenshots)
+            if exit_code == EXIT_PASS and rc != 0:
+                print("FAIL: all scenarios passed but the game exited with %s" % describe_exit(rc))
+                exit_code = EXIT_NO_START
+        if known_crash:
+            exit_code = EXIT_KNOWN_CRASH
+        changed = diff_snapshots(before, userdata_snapshot())
+        if changed:
+            print("FAIL: RimWorld user data outside the test launch changed:")
+            for line in changed:
+                print("  " + line)
+            exit_code = EXIT_USERDATA
+        else:
+            print("user data untouched (%d entries checked)" % len(before))
+    finally:
+        if not args.keep_game_farm and os.path.isdir(os.path.join(run_dir, "game")):
+            shutil.rmtree(os.path.join(run_dir, "game"))
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    prune(os.path.join(args.work_dir, "runs"))
+    print("result file: " + result_file)
+    print("OVERALL: " + ("PASS" if exit_code == EXIT_PASS else "FAIL (exit %d)" % exit_code))
+    return exit_code
+
+
+def prune(runs_dir, keep=15):
+    dirs = sorted(d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d)))
+    for d in dirs[:-keep]:
+        shutil.rmtree(os.path.join(runs_dir, d))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Interrupted as e:
+        print("INTERRUPTED by %s: the game was stopped before the lock was released" % signal.Signals(e.signum).name, file=sys.stderr)
+        sys.exit(128 + e.signum)
+    except SetupError as e:
+        print("SETUP ERROR: " + str(e), file=sys.stderr)
+        sys.exit(EXIT_SETUP)

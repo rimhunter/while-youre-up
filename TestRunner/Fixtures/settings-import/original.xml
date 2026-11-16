@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SettingsBlock>
+	<ModSettings Class="WhileYoureUp.Mod+Settings">
+		<Enabled>False</Enabled>
+		<DrawSpecialHauls>True</DrawSpecialHauls>
+		<Opportunity_PathChecker>Pathfinding</Opportunity_PathChecker>
+		<Opportunity_ToStockpiles>False</Opportunity_ToStockpiles>
+		<Opportunity_MaxStartToThing>45</Opportunity_MaxStartToThing>
+		<Opportunity_MaxStartToThingPctOrigTrip>0.75</Opportunity_MaxStartToThingPctOrigTrip>
+		<Opportunity_MaxTotalTripPctOrigTrip>2.25</Opportunity_MaxTotalTripPctOrigTrip>
+		<Opportunity_MaxStoreToJobRegionLookCount>40</Opportunity_MaxStoreToJobRegionLookCount>
+		<HaulBeforeCarry_Bills>False</HaulBeforeCarry_Bills>
+		<HaulBeforeCarry_AutoBuildings>False</HaulBeforeCarry_AutoBuildings>
+		<FutureSetting>Whatever</FutureSetting>
+	</ModSettings>
+</SettingsBlock>

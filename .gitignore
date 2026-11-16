@@ -1,0 +1,11 @@
+Assemblies/
+Keys.xml
+Settings.xml
+/bin/
+/obj/
+UpdateFeatures.xml
+Tests/**/bin/
+Tests/**/obj/
+/TestRunner/obj/
+/dist/
+__pycache__/

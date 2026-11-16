@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <GameVersion Condition="'$(GameVersion)' != '1.6' And '$(GameVersion)' != '1.7'">invalid</GameVersion>
+        <RimWorldRefVersion Condition="'$(GameVersion)' == '1.6'">1.6.4871</RimWorldRefVersion>
+        <RimWorldRefVersion Condition="'$(GameVersion)' == '1.7'">1.7.5005-unstable</RimWorldRefVersion>
+        <TargetFramework Condition="'$(GameVersion)' == '1.6'">net472</TargetFramework>
+        <TargetFramework Condition="'$(GameVersion)' == '1.7'">net10.0</TargetFramework>
+        <GameVersionConstant>RW_$(GameVersion.Replace('.', '_'))</GameVersionConstant>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <LangVersion>latest</LangVersion>
+        <AssemblyName>WyuTestRunner</AssemblyName>
+        <RootNamespace>WyuTestRunner</RootNamespace>
+        <Nullable>disable</Nullable>
+        <DefineConstants>$(DefineConstants);$(GameVersionConstant)</DefineConstants>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <OutputPath>$(MSBuildProjectDirectory)/../$(GameVersion)/Assemblies/</OutputPath>
+        <GenerateDocumentationFile>false</GenerateDocumentationFile>
+        <GenerateDependencyFile>false</GenerateDependencyFile>
+        <DebugType>portable</DebugType>
+    </PropertyGroup>
+
+    <Target Name="RequireGameVersion" BeforeTargets="BeforeBuild;Restore" Condition="'$(GameVersion)' == 'invalid'">
+        <Error Text="Set -p:GameVersion=1.6 or -p:GameVersion=1.7."/>
+    </Target>
+
+    <Target Name="BuildPuahStub" AfterTargets="Build">
+        <PropertyGroup>
+            <StubProject>$(MSBuildProjectDirectory)/../StubPuah/StubPuah.csproj</StubProject>
+            <StubObj>$(MSBuildProjectDirectory)/../obj/stub-puah/</StubObj>
+        </PropertyGroup>
+        <MSBuild Projects="$(StubProject)" Targets="Restore" Properties="BaseIntermediateOutputPath=$(StubObj);GameVersion=;MSBuildRestoreSessionId=$([System.Guid]::NewGuid())"/>
+        <MSBuild Projects="$(StubProject)" Targets="Build" Properties="BaseIntermediateOutputPath=$(StubObj);GameVersion="/>
+    </Target>
+
+    <ItemGroup>
+        <PackageReference Include="Lib.Harmony" Version="2.4.3" PrivateAssets="all" ExcludeAssets="runtime"/>
+        <PackageReference Include="Krafs.Rimworld.Ref" Version="$(RimWorldRefVersion)" PrivateAssets="all" ExcludeAssets="runtime"/>
+    </ItemGroup>
+</Project>

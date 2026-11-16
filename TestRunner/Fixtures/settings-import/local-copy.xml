@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SettingsBlock>
+	<ModSettings Class="JobsOfOpportunity.Mod+Settings">
+		<Opportunity_PathChecker>Vanilla</Opportunity_PathChecker>
+		<Opportunity_MaxStartToThing>12</Opportunity_MaxStartToThing>
+		<HaulBeforeCarry_Supplies>False</HaulBeforeCarry_Supplies>
+	</ModSettings>
+</SettingsBlock>
